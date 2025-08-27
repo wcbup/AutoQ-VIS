@@ -12,8 +12,8 @@
 ### Example conda environment setup
 
 ```bash
-conda create --name videocuter python=3.8 -y
-conda activate videocuter
+conda create --name autoqvis python=3.8 -y
+conda activate autoqvis
 conda install pytorch==1.9.0 torchvision==0.10.0 cudatoolkit=11.1 -c pytorch -c nvidia
 pip install -U opencv-python
 
@@ -30,8 +30,8 @@ After preparing the required environment, run the following command to compile C
 
 `CUDA_HOME` must be defined and points to the directory of the installed CUDA toolkit.
 ```bash
-pip install -r videocutler/requirements.txt
-cd videocutler/mask2former/modeling/pixel_decoder/ops
+pip install -r AutoQ-VIS/requirements.txt
+cd AutoQ-VIS/mask2former/modeling/pixel_decoder/ops
 sh make.sh
 ```
 
@@ -44,6 +44,6 @@ After preparing the required environment, run the following command to compile C
 
 `CUDA_HOME` must be defined and points to the directory of the installed CUDA toolkit.
 ```bash
-cd videocutler/mask2former/modeling/pixel_decoder/ops
+cd AutoQ-VIS/mask2former/modeling/pixel_decoder/ops
 sh make.sh
 ```

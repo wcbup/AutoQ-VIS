@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Modified by XuDong Wang from https://github.com/facebookresearch/detectron2/blob/main/detectron2/engine/defaults.py
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 """
 This file contains components with some default boilerplate logic user may need
@@ -50,6 +52,44 @@ from detectron2.utils.logger import setup_logger
 from detectron2.engine import hooks
 from detectron2.engine import TrainerBase
 from .train_loop import CustomAMPTrainer, CustomSimpleTrainer
+
+from .infer_utils import (
+    save_results_with_iou_threshold,
+    create_total_info,
+    count_frame_num,
+    get_median_iou,
+    count_video_num,
+    build_total_info_from_raw_res,
+    combine_raw_info,
+    build_total_info,
+    restruct_signal_results,
+    filter_signal_dict,
+    combine_raw_info_with_signal,
+    restruct_score_results,
+    fileter_score_dict,
+    restruct_prediou_results,
+    filter_prediou_dict,
+    get_perc_prediou_threshold,
+    restruct_key_results,
+    get_perc_metric_threshold,
+    filter_metric_dict,
+    MyYTVIS,
+    analysis_yvis,
+    get_perc_metric_threshold_min,
+    filter_metric_dict_min,
+    get_perc_metric_thresholdV2_min,
+    filter_metric_dictV2_min,
+    get_object_perc_metric_threshold,
+    construct_object_based_dict,
+    construct_frame_based_dict,
+    remove_low_quality_objects,
+    merge_object_based_results,
+    filter_marked_results,
+    mark_results,
+)
+import json
+import gc
+import shutil
 
 __all__ = [
     "create_ddp_model",
@@ -110,18 +150,29 @@ Run on multiple machines:
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+    parser.add_argument(
+        "--config-file", default="", metavar="FILE", help="path to config file"
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
         help="Whether to attempt to resume from the checkpoint directory. "
         "See documentation of `DefaultTrainer.resume_or_load()` for what it means.",
     )
-    parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
-    parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
-    parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument(
-        "--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)"
+        "--eval-only", action="store_true", help="perform evaluation only"
+    )
+    parser.add_argument(
+        "--num-gpus", type=int, default=1, help="number of gpus *per machine*"
+    )
+    parser.add_argument(
+        "--num-machines", type=int, default=1, help="total number of machines"
+    )
+    parser.add_argument(
+        "--machine-rank",
+        type=int,
+        default=0,
+        help="the rank of this machine (unique per machine)",
     )
     parser.add_argument(
         "--test-dataset", type=str, default="", help="the dataset used for evaluation"
@@ -132,7 +183,9 @@ Run on multiple machines:
     parser.add_argument(
         "--wandb-name", type=str, default="", help="the wandb project name"
     )
-    parser.add_argument("--no-segm", action="store_true", help="perform evaluation on detection only")
+    parser.add_argument(
+        "--no-segm", action="store_true", help="perform evaluation on detection only"
+    )
     # PyTorch still may leave orphan processes in multi-gpu training.
     # Therefore we use a deterministic way to obtain port,
     # so that users are aware of orphan processes by seeing the port occupied.
@@ -204,7 +257,11 @@ def default_setup(cfg, args):
     setup_logger(output_dir, distributed_rank=rank, name="fvcore")
     logger = setup_logger(output_dir, distributed_rank=rank)
 
-    logger.info("Rank of current process: {}. World size: {}".format(rank, comm.get_world_size()))
+    logger.info(
+        "Rank of current process: {}. World size: {}".format(
+            rank, comm.get_world_size()
+        )
+    )
     logger.info("Environment info:\n" + collect_env_info())
 
     logger.info("Command line arguments: " + str(args))
@@ -212,7 +269,9 @@ def default_setup(cfg, args):
         logger.info(
             "Contents of args.config_file={}:\n{}".format(
                 args.config_file,
-                _highlight(PathManager.open(args.config_file, "r").read(), args.config_file),
+                _highlight(
+                    PathManager.open(args.config_file, "r").read(), args.config_file
+                ),
             )
         )
 
@@ -221,7 +280,9 @@ def default_setup(cfg, args):
         # config.yaml in output directory
         path = os.path.join(output_dir, "config.yaml")
         if isinstance(cfg, CfgNode):
-            logger.info("Running with full config:\n{}".format(_highlight(cfg.dump(), ".yaml")))
+            logger.info(
+                "Running with full config:\n{}".format(_highlight(cfg.dump(), ".yaml"))
+            )
             with PathManager.open(path, "w") as f:
                 f.write(cfg.dump())
         else:
@@ -406,6 +467,21 @@ class DefaultTrainer(TrainerBase):
         self.start_iter = 0
         self.max_iter = cfg.SOLVER.MAX_ITER
         self.cfg = cfg
+        self.best_iou = 0
+        self.model_name = None
+        self.test_mode = None
+        self.iou_threshold = None
+        self.signal_threshold = None
+        self.score_threshold = None
+        self.pred_iou_threshold = None
+        self.pred_iou_percents = None
+        self.pred_iou_index = 1
+        self.gt_ytvis = None
+        self.test_datasets = None
+        self.round_idx = None
+        self.frame_score_iou_percents = None
+        self.frame_pred_iou_index = 1
+        self.score_iou_threshold = None
 
         self.register_hooks(self.build_hooks())
 
@@ -444,16 +520,18 @@ class DefaultTrainer(TrainerBase):
         ret = [
             hooks.IterationTimer(),
             hooks.LRScheduler(),
-            hooks.PreciseBN(
-                # Run at the same freq as (but before) evaluation.
-                cfg.TEST.EVAL_PERIOD,
-                self.model,
-                # Build a new data loader to not affect training
-                self.build_train_loader(cfg),
-                cfg.TEST.PRECISE_BN.NUM_ITER,
-            )
-            if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
-            else None,
+            (
+                hooks.PreciseBN(
+                    # Run at the same freq as (but before) evaluation.
+                    cfg.TEST.EVAL_PERIOD,
+                    self.model,
+                    # Build a new data loader to not affect training
+                    self.build_train_loader(cfg),
+                    cfg.TEST.PRECISE_BN.NUM_ITER,
+                )
+                if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
+                else None
+            ),
         ]
 
         # Do PreciseBN before checkpointer, because it updates the model and need to
@@ -461,11 +539,1554 @@ class DefaultTrainer(TrainerBase):
         # This is not always the best: if checkpointing has a different frequency,
         # some checkpoints may have more precise statistics than others.
         if comm.is_main_process():
-            ret.append(hooks.PeriodicCheckpointer(self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD))
+            ret.append(
+                hooks.PeriodicCheckpointer(
+                    self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD
+                )
+            )
 
         def test_and_save_results():
             self._last_eval_results = self.test(self.cfg, self.model)
-            return self._last_eval_results
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger = logging.getLogger(__name__)
+            # if "mean_iou" in self._last_eval_results:
+            if self.test_mode == "only_iou":
+                current_iou = self._last_eval_results["mean_iou"]
+            # elif self.model_name == None:
+            elif self.test_mode == "davis_inf_0.8":
+                val_results = self._last_eval_results["davis_val_half"]
+                current_iou = val_results["mean_iou"]
+
+                train_results = self._last_eval_results["davis_train_half"]
+                iou_threshold = 0.8
+                save_bast_path = "datasets/DAVIS/train_inference"
+                info_path = "datasets/DAVIS/train_inference.json"
+                logger.info(f"Train mean IoU: {train_results['mean_iou']}")
+                logger.info(
+                    "Saving train results with IoU threshold: {:.2f}".format(
+                        iou_threshold
+                    )
+                )
+                save_results_with_iou_threshold(
+                    train_results["results"], save_bast_path, iou_threshold
+                )
+
+                total_info = create_total_info(save_bast_path)
+                frame_num = count_frame_num(total_info)
+                logger.info(f"Train frame number: {frame_num}")
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                # reload the dataloader
+                new_loader = self.get_train_loader(cfg, "davis_train_inference")
+                self._trainer.data_loader.loader1 = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "davis_inf_med":
+                val_results = self._last_eval_results["davis_val_half"]
+                current_iou = val_results["mean_iou"]
+
+                train_results = self._last_eval_results["davis_train_half"]
+                save_base_path = f"datasets/DAVIS/{self.model_name}"
+                info_path = f"datasets/DAVIS/{self.model_name}.json"
+                # delete the previous results
+                if os.path.exists(save_base_path):
+                    shutil.rmtree(save_base_path)
+                if os.path.exists(info_path):
+                    os.remove(info_path)
+                iou_threshold = get_median_iou(train_results["results"])
+                logger.info(f"Train mean IoU: {train_results['mean_iou']}")
+                logger.info(
+                    "Saving train results with IoU threshold: {:.4f}".format(
+                        iou_threshold
+                    )
+                )
+                save_results_with_iou_threshold(
+                    train_results["results"], save_base_path, iou_threshold
+                )
+                total_info = create_total_info(save_base_path)
+                frame_num = count_frame_num(total_info)
+                logger.info(f"Train frame number: {frame_num}")
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+
+                # reload the dataloader
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                self._trainer.data_loader.loader1 = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+            elif self.test_mode == "ytvis_default":
+                if comm.is_main_process():
+                    ap50 = self._last_eval_results["segm"]["AP50"]
+                    logger.info("Current AP50: {:.4f}".format(ap50))
+                    if ap50 > self.best_iou:
+                        self.best_iou = ap50
+                        # save the best model
+                        self.checkpointer.save("model_best")
+                        logger.info("Best model saved as model_best.pth")
+                return self._last_eval_results
+            elif self.test_mode == "ytvis_infer":
+                val_results = self._last_eval_results["ytvis_2019_val_new"]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results["ytvis_2019_train_new"]["results"]
+                if self.iou_threshold is None:
+                    raise ValueError("iou_threshold is None")
+                logger.info(
+                    "Saving inference results with IoU threshold: {:.2f}".format(
+                        self.iou_threshold
+                    )
+                )
+                total_info = build_total_info_from_raw_res(
+                    inf_results, self.iou_threshold
+                )
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                self._trainer.data_loader.loader1 = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_infer_pure":
+                val_results = self._last_eval_results["ytvis_2019_val_new"]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results["ytvis_2019_train_new"]["results"]
+                if self.iou_threshold is None:
+                    raise ValueError("iou_threshold is None")
+                logger.info(
+                    "Saving inference results with IoU threshold: {:.2f}".format(
+                        self.iou_threshold
+                    )
+                )
+                total_info = build_total_info_from_raw_res(
+                    inf_results, self.iou_threshold
+                )
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_infer_aug":
+                if comm.is_main_process():
+                    val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                    ap50 = val_results["segm"]["AP50"]
+                    current_iou = ap50
+                    logger.info("Current AP50: {:.4f}".format(ap50))
+                    if ap50 > self.best_iou:
+                        self.best_iou = ap50
+                        # save the best model
+                        self.checkpointer.save("model_best")
+                        logger.info("Best model saved as model_best.pth")
+
+                    inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                    if self.iou_threshold is None:
+                        raise ValueError("iou_threshold is None")
+                    logger.info(
+                        "Saving inference results with IoU threshold: {:.2f}".format(
+                            self.iou_threshold
+                        )
+                    )
+
+                    info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                    raw_info_path = f"datasets/ytvis_2019/{self.model_name}_raw.json"
+                    old_raw_info = json.load(open(raw_info_path, "r"))
+
+                    def replace_str_key_with_int_key(old_raw_info):
+                        new_raw_info = {}
+                        for key, value in old_raw_info.items():
+                            new_key = int(key)
+                            new_raw_info[new_key] = value
+                        return new_raw_info
+
+                    old_raw_info = replace_str_key_with_int_key(old_raw_info)
+                    _, new_raw_info = build_total_info_from_raw_res(
+                        inf_results, self.iou_threshold, output_raw=True
+                    )
+                    combined_raw_info = combine_raw_info(old_raw_info, new_raw_info)
+                    with open(raw_info_path, "w") as f:
+                        json.dump(combined_raw_info, f)
+                    total_info = build_total_info(combined_raw_info)
+                    frame_num = count_frame_num(total_info)
+                    video_num = count_video_num(total_info)
+                    logger.info(f"Frame number: {frame_num}")
+                    logger.info(f"Video number: {video_num}")
+                    with open(info_path, "w") as f:
+                        json.dump(total_info, f)
+                comm.synchronize()
+
+                # update the dataloader
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_signal":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                if self.signal_threshold is None:
+                    raise ValueError("signal_threshold is None")
+                logger.info(
+                    "Saving inference results with signal threshold: {:.2f}".format(
+                        self.signal_threshold
+                    )
+                )
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                results_dict = restruct_signal_results(inf_results)
+                raw_info = filter_signal_dict(results_dict, self.signal_threshold)
+                total_info = build_total_info(raw_info)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+
+                # update the dataloader
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_signal_aug":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                if self.signal_threshold is None:
+                    raise ValueError("signal_threshold is None")
+                logger.info(
+                    "Saving inference results with signal threshold: {:.2f}".format(
+                        self.signal_threshold
+                    )
+                )
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                raw_info_path = f"datasets/ytvis_2019/{self.model_name}_raw.json"
+                old_raw_info = json.load(open(raw_info_path, "r"))
+
+                def replace_str_key_with_int_key(old_raw_info):
+                    new_raw_info = {}
+                    for key, value in old_raw_info.items():
+                        new_key = int(key)
+                        new_raw_info[new_key] = value
+                    return new_raw_info
+
+                old_raw_info = replace_str_key_with_int_key(old_raw_info)
+                results_dict = restruct_signal_results(inf_results)
+                new_raw_info = filter_signal_dict(results_dict, self.signal_threshold)
+                combined_raw_info = combine_raw_info_with_signal(
+                    old_raw_info, new_raw_info
+                )
+                total_info = build_total_info(combined_raw_info)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                with open(raw_info_path, "w") as f:
+                    json.dump(combined_raw_info, f)
+
+                # update the dataloader
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    new_loader = self.get_train_loader(cfg, self.model_name)
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_test":
+                val_results = self._last_eval_results["ytvis_2019_val_new"]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results["ytvis_2019_small"]["results"]
+                if self.iou_threshold is None:
+                    raise ValueError("iou_threshold is None")
+                logger.info(
+                    "Saving inference results with IoU threshold: {:.2f}".format(
+                        self.iou_threshold
+                    )
+                )
+                total_info = build_total_info_from_raw_res(
+                    inf_results, self.iou_threshold
+                )
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                self._trainer.data_loader.loader1 = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_iou_pred_test":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+
+            elif self.test_mode == "ytvis_iou_pred":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+
+                inf_results = inf_results["total_results"]
+                logger.info(
+                    "Saving inference results with pred_iou threshold: {:.2f}".format(
+                        self.pred_iou_threshold
+                    )
+                )
+                results_dict = restruct_prediou_results(inf_results)
+                filtered_results = filter_prediou_dict(
+                    results_dict, self.pred_iou_threshold
+                )
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_iou_pred_perc":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+
+                inf_results = inf_results["total_results"]
+                pred_iou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+
+                results_dict = restruct_prediou_results(inf_results)
+                pred_iou_threshold = get_perc_prediou_threshold(
+                    results_dict, pred_iou_percent
+                )
+                logger.info(f"Pred iou threshold: {pred_iou_threshold:.4f}")
+                filtered_results = filter_prediou_dict(results_dict, pred_iou_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "ytvis_scoreiou_perc":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dict(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_nms":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dict(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_nms_min":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_threshold_min(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dict_min(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+
+            elif self.test_mode == "ytvis_scoreiou_perc_nms_minV2":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_thresholdV2_min(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dictV2_min(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_adding":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                if self.pred_iou_index >= len(self.pred_iou_percents):
+                    self.pred_iou_index = len(self.pred_iou_percents) - 1
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                
+                metric_threshold = get_object_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                new_marked_results = mark_results(
+                    results_dict, metric_threshold, min_frame_num=2
+                )
+                new_object_based_results = construct_object_based_dict(new_marked_results)
+                new_object_based_results = remove_low_quality_objects(
+                    new_object_based_results, min_frame_num=2
+                )
+
+                old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                def load_object_based_results(file_path):
+                    """
+                    Load the object based results from a json file.
+                    :param file_path: The path to the json file
+                    :return: The object based results
+                    """
+                    with open(file_path, "r") as f:
+                        object_based_results = json.load(f)
+                    # convert the string keys to integers
+                    new_object_based_results = {}
+                    for video_id, video_results in object_based_results.items():
+                        new_video_results = {}
+                        for object_id, object_results in video_results.items():
+                            new_object_results = {}
+                            for frame_id, frame_result in object_results.items():
+                                new_object_results[int(frame_id)] = frame_result
+                            new_video_results[int(object_id)] = new_object_results
+                        new_object_based_results[int(video_id)] = new_video_results
+                    return new_object_based_results
+                old_object_based_results = load_object_based_results(
+                    old_object_based_results_path
+                )
+                merged_object_based_results = merge_object_based_results(
+                    old_object_based_results, new_object_based_results
+                )
+                merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                self.round_idx += 1
+                with open(merged_objcet_based_results_path, "w") as f:
+                    json.dump(merged_object_based_results, f, indent=4)
+                merged_frame_based_results = construct_frame_based_dict(
+                    merged_object_based_results
+                )
+                filtered_results = filter_marked_results(
+                    merged_frame_based_results, min_frame_num=2
+                )
+
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_adding_refresh":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                if self.pred_iou_index >= len(self.pred_iou_percents):
+                    self.pred_iou_index = len(self.pred_iou_percents) - 1
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                
+                metric_threshold = get_object_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                new_marked_results = mark_results(
+                    results_dict, metric_threshold, min_frame_num=2
+                )
+                new_object_based_results = construct_object_based_dict(new_marked_results)
+                new_object_based_results = remove_low_quality_objects(
+                    new_object_based_results, min_frame_num=2
+                )
+                
+                old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                def load_object_based_results(file_path):
+                    """
+                    Load the object based results from a json file.
+                    :param file_path: The path to the json file
+                    :return: The object based results
+                    """
+                    with open(file_path, "r") as f:
+                        object_based_results = json.load(f)
+                    # convert the string keys to integers
+                    new_object_based_results = {}
+                    for video_id, video_results in object_based_results.items():
+                        new_video_results = {}
+                        for object_id, object_results in video_results.items():
+                            new_object_results = {}
+                            for frame_id, frame_result in object_results.items():
+                                new_object_results[int(frame_id)] = frame_result
+                            new_video_results[int(object_id)] = new_object_results
+                        new_object_based_results[int(video_id)] = new_video_results
+                    return new_object_based_results
+                old_object_based_results = load_object_based_results(
+                    old_object_based_results_path
+                )
+                merged_object_based_results = merge_object_based_results(
+                    old_object_based_results, new_object_based_results
+                )
+                merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                self.round_idx += 1
+                with open(merged_objcet_based_results_path, "w") as f:
+                    json.dump(merged_object_based_results, f, indent=4)
+                merged_frame_based_results = construct_frame_based_dict(
+                    merged_object_based_results
+                )
+                filtered_results = filter_marked_results(
+                    merged_frame_based_results, min_frame_num=2
+                )
+
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+
+                self.resume_or_load(resume=False)
+                logger.info("Model reloaded for next round of training.")
+                model = self._trainer.model
+                new_optimizer = self.build_optimizer(cfg, model)
+                self._trainer.optimizer = new_optimizer
+                self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                logger.info("Optimizer and scheduler reloaded for next round of training.")
+
+                # new_model = self.build_model(cfg)
+                # new_optimizer = self.build_optimizer(cfg, new_model)
+                # new_model = create_ddp_model(new_model, broadcast_buffers=False)
+                # self._trainer.model = new_model
+                # self._trainer.optimizer = new_optimizer
+                # self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                # self.checkpointer = DetectionCheckpointer(
+                #     new_model,
+                #     cfg.OUTPUT_DIR,
+                #     trainer=weakref.proxy(self),
+                # )
+                # self.resume_or_load(resume=False)
+                # logger.info("Model reloaded for next round of training.")
+                # logger.info("Optimizer and scheduler reloaded for next round of training.")
+            
+            elif self.test_mode == "ytvis_scoreiou_cn_adding_refresh":
+                if comm.is_main_process():
+                    val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                    ap50 = val_results["segm"]["AP50"]
+                    current_iou = ap50
+                    logger.info("Current AP50: {:.4f}".format(ap50))
+                    if ap50 > self.best_iou:
+                        self.best_iou = ap50
+                        # save the best model
+                        self.checkpointer.save("model_best")
+                        logger.info("Best model saved as model_best.pth")
+                    inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                    pearson_score = inf_results["pearson"]
+                    spearman_score = inf_results["spearman"]
+                    logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                    logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                    inf_results = inf_results["total_results"]
+                    results_dict = restruct_key_results(inf_results, "score_ious")
+                    
+                    metric_threshold = self.score_iou_threshold
+                    logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                    new_marked_results = mark_results(
+                        results_dict, metric_threshold, min_frame_num=2
+                    )
+                    new_object_based_results = construct_object_based_dict(new_marked_results)
+                    new_object_based_results = remove_low_quality_objects(
+                        new_object_based_results, min_frame_num=2
+                    )
+                    
+                    old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                    def load_object_based_results(file_path):
+                        """
+                        Load the object based results from a json file.
+                        :param file_path: The path to the json file
+                        :return: The object based results
+                        """
+                        with open(file_path, "r") as f:
+                            object_based_results = json.load(f)
+                        # convert the string keys to integers
+                        new_object_based_results = {}
+                        for video_id, video_results in object_based_results.items():
+                            new_video_results = {}
+                            for object_id, object_results in video_results.items():
+                                new_object_results = {}
+                                for frame_id, frame_result in object_results.items():
+                                    new_object_results[int(frame_id)] = frame_result
+                                new_video_results[int(object_id)] = new_object_results
+                            new_object_based_results[int(video_id)] = new_video_results
+                        return new_object_based_results
+                    old_object_based_results = load_object_based_results(
+                        old_object_based_results_path
+                    )
+                    merged_object_based_results = merge_object_based_results(
+                        old_object_based_results, new_object_based_results
+                    )
+                    merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                    self.round_idx += 1
+                    with open(merged_objcet_based_results_path, "w") as f:
+                        json.dump(merged_object_based_results, f, indent=4)
+                    merged_frame_based_results = construct_frame_based_dict(
+                        merged_object_based_results
+                    )
+                    filtered_results = filter_marked_results(
+                        merged_frame_based_results, min_frame_num=2
+                    )
+
+                    total_info = build_total_info(filtered_results)
+                    frame_num = count_frame_num(total_info)
+                    video_num = count_video_num(total_info)
+                    object_num = len(total_info["annotations"])
+                    logger.info("Frame number: {}".format(frame_num))
+                    logger.info("Video number: {}".format(video_num))
+                    logger.info("Object number: {}".format(object_num))
+                    info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                    with open(info_path, "w") as f:
+                        json.dump(total_info, f)
+                    inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                    analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                    gt_object_counts = analysis_result["gt_object_counts"]
+                    inf_object_counts = analysis_result["inf_object_counts"]
+                    intersection_counts = analysis_result["intersection_counts"]
+                    logger.info("GT object counts: {}".format(gt_object_counts))
+                    logger.info("INF object counts: {}".format(inf_object_counts))
+                    logger.info("Intersection counts: {}".format(intersection_counts))
+                comm.synchronize()
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                self.resume_or_load(resume=False)
+                logger.info("Model reloaded for next round of training.")
+                model = self._trainer.model
+                new_optimizer = self.build_optimizer(cfg, model)
+                self._trainer.optimizer = new_optimizer
+                self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                logger.info("Optimizer and scheduler reloaded for next round of training.")
+
+            elif self.test_mode == "ytvis_scoreiou_cn_adding":
+                if comm.is_main_process():
+                    val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                    ap50 = val_results["segm"]["AP50"]
+                    current_iou = ap50
+                    logger.info("Current AP50: {:.4f}".format(ap50))
+                    if ap50 > self.best_iou:
+                        self.best_iou = ap50
+                        # save the best model
+                        self.checkpointer.save("model_best")
+                        logger.info("Best model saved as model_best.pth")
+                    inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                    pearson_score = inf_results["pearson"]
+                    spearman_score = inf_results["spearman"]
+                    logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                    logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                    inf_results = inf_results["total_results"]
+                    results_dict = restruct_key_results(inf_results, "score_ious")
+                    
+                    metric_threshold = self.score_iou_threshold
+                    logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                    new_marked_results = mark_results(
+                        results_dict, metric_threshold, min_frame_num=2
+                    )
+                    new_object_based_results = construct_object_based_dict(new_marked_results)
+                    new_object_based_results = remove_low_quality_objects(
+                        new_object_based_results, min_frame_num=2
+                    )
+                    
+                    old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                    def load_object_based_results(file_path):
+                        """
+                        Load the object based results from a json file.
+                        :param file_path: The path to the json file
+                        :return: The object based results
+                        """
+                        with open(file_path, "r") as f:
+                            object_based_results = json.load(f)
+                        # convert the string keys to integers
+                        new_object_based_results = {}
+                        for video_id, video_results in object_based_results.items():
+                            new_video_results = {}
+                            for object_id, object_results in video_results.items():
+                                new_object_results = {}
+                                for frame_id, frame_result in object_results.items():
+                                    new_object_results[int(frame_id)] = frame_result
+                                new_video_results[int(object_id)] = new_object_results
+                            new_object_based_results[int(video_id)] = new_video_results
+                        return new_object_based_results
+                    old_object_based_results = load_object_based_results(
+                        old_object_based_results_path
+                    )
+                    merged_object_based_results = merge_object_based_results(
+                        old_object_based_results, new_object_based_results
+                    )
+                    merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                    self.round_idx += 1
+                    with open(merged_objcet_based_results_path, "w") as f:
+                        json.dump(merged_object_based_results, f, indent=4)
+                    merged_frame_based_results = construct_frame_based_dict(
+                        merged_object_based_results
+                    )
+                    filtered_results = filter_marked_results(
+                        merged_frame_based_results, min_frame_num=2
+                    )
+
+                    total_info = build_total_info(filtered_results)
+                    frame_num = count_frame_num(total_info)
+                    video_num = count_video_num(total_info)
+                    object_num = len(total_info["annotations"])
+                    logger.info("Frame number: {}".format(frame_num))
+                    logger.info("Video number: {}".format(video_num))
+                    logger.info("Object number: {}".format(object_num))
+                    info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                    with open(info_path, "w") as f:
+                        json.dump(total_info, f)
+                    inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                    analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                    gt_object_counts = analysis_result["gt_object_counts"]
+                    inf_object_counts = analysis_result["inf_object_counts"]
+                    intersection_counts = analysis_result["intersection_counts"]
+                    logger.info("GT object counts: {}".format(gt_object_counts))
+                    logger.info("INF object counts: {}".format(inf_object_counts))
+                    logger.info("Intersection counts: {}".format(intersection_counts))
+                comm.synchronize()
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                # self.resume_or_load(resume=False)
+                # logger.info("Model reloaded for next round of training.")
+                # model = self._trainer.model
+                # new_optimizer = self.build_optimizer(cfg, model)
+                # self._trainer.optimizer = new_optimizer
+                # self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                # logger.info("Optimizer and scheduler reloaded for next round of training.")
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_adding_refreshOp":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                if self.pred_iou_index >= len(self.pred_iou_percents):
+                    self.pred_iou_index = len(self.pred_iou_percents) - 1
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                
+                metric_threshold = get_object_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                new_marked_results = mark_results(
+                    results_dict, metric_threshold, min_frame_num=2
+                )
+                new_object_based_results = construct_object_based_dict(new_marked_results)
+                new_object_based_results = remove_low_quality_objects(
+                    new_object_based_results, min_frame_num=2
+                )
+                
+                old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                def load_object_based_results(file_path):
+                    """
+                    Load the object based results from a json file.
+                    :param file_path: The path to the json file
+                    :return: The object based results
+                    """
+                    with open(file_path, "r") as f:
+                        object_based_results = json.load(f)
+                    # convert the string keys to integers
+                    new_object_based_results = {}
+                    for video_id, video_results in object_based_results.items():
+                        new_video_results = {}
+                        for object_id, object_results in video_results.items():
+                            new_object_results = {}
+                            for frame_id, frame_result in object_results.items():
+                                new_object_results[int(frame_id)] = frame_result
+                            new_video_results[int(object_id)] = new_object_results
+                        new_object_based_results[int(video_id)] = new_video_results
+                    return new_object_based_results
+                old_object_based_results = load_object_based_results(
+                    old_object_based_results_path
+                )
+                merged_object_based_results = merge_object_based_results(
+                    old_object_based_results, new_object_based_results
+                )
+                merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                self.round_idx += 1
+                with open(merged_objcet_based_results_path, "w") as f:
+                    json.dump(merged_object_based_results, f, indent=4)
+                merged_frame_based_results = construct_frame_based_dict(
+                    merged_object_based_results
+                )
+                filtered_results = filter_marked_results(
+                    merged_frame_based_results, min_frame_num=2
+                )
+
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+
+                # self.resume_or_load(resume=False)
+                # logger.info("Model reloaded for next round of training.")
+                model = self._trainer.model
+                new_optimizer = self.build_optimizer(cfg, model)
+                self._trainer.optimizer = new_optimizer
+                self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                logger.info("Optimizer and scheduler reloaded for next round of training.")
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_adding_fra":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                if self.pred_iou_index >= len(self.pred_iou_percents):
+                    self.pred_iou_index = len(self.pred_iou_percents) - 1
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                frame_scoreiou_percent = self.frame_score_iou_percents[self.frame_pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                if self.frame_pred_iou_index >= len(self.frame_score_iou_percents):
+                    self.frame_pred_iou_index = len(self.frame_score_iou_percents) - 1
+                if self.frame_pred_iou_index < len(self.frame_score_iou_percents) - 1:
+                    self.frame_pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                
+                metric_threshold = get_object_perc_metric_threshold(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                new_marked_results = mark_results(
+                    results_dict, metric_threshold, min_frame_num=2
+                )
+                new_object_based_results = construct_object_based_dict(new_marked_results)
+                new_object_based_results = remove_low_quality_objects(
+                    new_object_based_results, min_frame_num=2
+                )
+
+                
+                old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                def load_object_based_results(file_path):
+                    """
+                    Load the object based results from a json file.
+                    :param file_path: The path to the json file
+                    :return: The object based results
+                    """
+                    with open(file_path, "r") as f:
+                        object_based_results = json.load(f)
+                    # convert the string keys to integers
+                    new_object_based_results = {}
+                    for video_id, video_results in object_based_results.items():
+                        new_video_results = {}
+                        for object_id, object_results in video_results.items():
+                            new_object_results = {}
+                            for frame_id, frame_result in object_results.items():
+                                new_object_results[int(frame_id)] = frame_result
+                            new_video_results[int(object_id)] = new_object_results
+                        new_object_based_results[int(video_id)] = new_video_results
+                    return new_object_based_results
+                old_object_based_results = load_object_based_results(
+                    old_object_based_results_path
+                )
+                merged_object_based_results = merge_object_based_results(
+                    old_object_based_results, new_object_based_results
+                )
+                merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                self.round_idx += 1
+                with open(merged_objcet_based_results_path, "w") as f:
+                    json.dump(merged_object_based_results, f, indent=4)
+                merged_frame_based_results = construct_frame_based_dict(
+                    merged_object_based_results
+                )
+                # filtered_results = filter_marked_results(
+                #     merged_frame_based_results, min_frame_num=2
+                # )
+                new_metric_threshold = get_perc_metric_thresholdV2_min(
+                    merged_frame_based_results, frame_scoreiou_percent
+                )
+                logger.info(f"frame metric threshold: {new_metric_threshold:.4f}")
+                filtered_results = filter_metric_dictV2_min(
+                    merged_frame_based_results, new_metric_threshold, min_frame_num=2
+                )
+
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+
+
+            
+            elif self.test_mode == "mose_scoreiou_perc_nms_minV2":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_thresholdV2_min(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dictV2_min(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/mose/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+            
+            elif self.test_mode == "mose_adding_refresh":
+                if comm.is_main_process():
+                    val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                    ap50 = val_results["segm"]["AP50"]
+                    current_iou = ap50
+                    logger.info("Current AP50: {:.4f}".format(ap50))
+                    if ap50 > self.best_iou:
+                        self.best_iou = ap50
+                        # save the best model
+                        self.checkpointer.save("model_best")
+                        logger.info("Best model saved as model_best.pth")
+                    inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                    inf_results = inf_results["total_results"]
+                    if self.pred_iou_index >= len(self.pred_iou_percents):
+                        self.pred_iou_index = len(self.pred_iou_percents) - 1
+                    scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                    if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                        self.pred_iou_index += 1
+                    results_dict = restruct_key_results(inf_results, "score_ious")
+                    
+                    metric_threshold = get_object_perc_metric_threshold(
+                        results_dict, scoreiou_percent
+                    )
+                    logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+
+                    new_marked_results = mark_results(
+                        results_dict, metric_threshold, min_frame_num=2
+                    )
+                    new_object_based_results = construct_object_based_dict(new_marked_results)
+                    new_object_based_results = remove_low_quality_objects(
+                        new_object_based_results, min_frame_num=2
+                    )
+                    
+                    old_object_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx - 1}.json"
+                    def load_object_based_results(file_path):
+                        """
+                        Load the object based results from a json file.
+                        :param file_path: The path to the json file
+                        :return: The object based results
+                        """
+                        with open(file_path, "r") as f:
+                            object_based_results = json.load(f)
+                        # convert the string keys to integers
+                        new_object_based_results = {}
+                        for video_id, video_results in object_based_results.items():
+                            new_video_results = {}
+                            for object_id, object_results in video_results.items():
+                                new_object_results = {}
+                                for frame_id, frame_result in object_results.items():
+                                    new_object_results[int(frame_id)] = frame_result
+                                new_video_results[int(object_id)] = new_object_results
+                            new_object_based_results[int(video_id)] = new_video_results
+                        return new_object_based_results
+                    old_object_based_results = load_object_based_results(
+                        old_object_based_results_path
+                    )
+                    merged_object_based_results = merge_object_based_results(
+                        old_object_based_results, new_object_based_results
+                    )
+                    merged_objcet_based_results_path = f"OUTPUT-DIR/{self.model_name}/object_based_results_{self.round_idx}.json"
+                    self.round_idx += 1
+                    with open(merged_objcet_based_results_path, "w") as f:
+                        json.dump(merged_object_based_results, f, indent=4)
+                    merged_frame_based_results = construct_frame_based_dict(
+                        merged_object_based_results
+                    )
+                    filtered_results = filter_marked_results(
+                        merged_frame_based_results, min_frame_num=2
+                    )
+
+                    total_info = build_total_info(filtered_results)
+                    frame_num = count_frame_num(total_info)
+                    video_num = count_video_num(total_info)
+                    object_num = len(total_info["annotations"])
+                    logger.info("Frame number: {}".format(frame_num))
+                    logger.info("Video number: {}".format(video_num))
+                    logger.info("Object number: {}".format(object_num))
+                    info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                    with open(info_path, "w") as f:
+                        json.dump(total_info, f)
+                comm.synchronize()
+
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                self.resume_or_load(resume=False)
+                logger.info("Model reloaded for next round of training.")
+                model = self._trainer.model
+                new_optimizer = self.build_optimizer(cfg, model)
+                self._trainer.optimizer = new_optimizer
+                self.scheduler = self.build_lr_scheduler(cfg, new_optimizer)
+                logger.info("Optimizer and scheduler reloaded for next round of training.")
+            
+            elif self.test_mode == "ytvis_scoreiou_perc_nms_min_sw":
+                val_results = self._last_eval_results[self.cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                
+                inf_results = self._last_eval_results[self.cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info(f"Current Inference Dataset: {self.cfg.DATASETS.TEST[0]}")
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+                inf_results = inf_results["total_results"]
+                scoreiou_percent = self.pred_iou_percents[self.pred_iou_index]
+                if self.pred_iou_index < len(self.pred_iou_percents) - 1:
+                    self.pred_iou_index += 1
+                results_dict = restruct_key_results(inf_results, "score_ious")
+                metric_threshold = get_perc_metric_threshold_min(
+                    results_dict, scoreiou_percent
+                )
+                logger.info(f"score_iou threshold: {metric_threshold:.4f}")
+                filtered_results = filter_metric_dict_min(results_dict, metric_threshold)
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                object_num = len(total_info["annotations"])
+                logger.info("Frame number: {}".format(frame_num))
+                logger.info("Video number: {}".format(video_num))
+                logger.info("Object number: {}".format(object_num))
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(self.cfg, self.model_name)
+                if len(self.cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+                inf_ytvis = MyYTVIS(total_info, "datasets/ytvis_2019/train/JPEGImages")
+                analysis_result = analysis_yvis(gt_yvis=self.gt_ytvis, inf_ytvis=inf_ytvis)
+                gt_object_counts = analysis_result["gt_object_counts"]
+                inf_object_counts = analysis_result["inf_object_counts"]
+                intersection_counts = analysis_result["intersection_counts"]
+                logger.info("GT object counts: {}".format(gt_object_counts))
+                logger.info("INF object counts: {}".format(inf_object_counts))
+                logger.info("Intersection counts: {}".format(intersection_counts))
+
+                def switch_test_dataset_0(cfg, new_test_datasets):
+                    cfg.defrost()
+                    old_test_datasets = cfg.DATASETS.TEST
+                    new_test_dataset_1 = old_test_datasets[1]
+                    old_test_dataset_0 = old_test_datasets[0]
+                    if old_test_dataset_0 == new_test_datasets[0]:
+                        new_test_dataset_0 = new_test_datasets[1]
+                    else:
+                        assert old_test_dataset_0 == new_test_datasets[1]
+                        new_test_dataset_0 = new_test_datasets[0]
+                    cfg.DATASETS.TEST = (new_test_dataset_0, new_test_dataset_1)
+                    cfg.freeze()
+                    return cfg
+                switch_test_dataset_0(self.cfg, self.test_datasets)
+
+            elif self.test_mode == "ytvis_infer_score":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                results_dict = restruct_score_results(inf_results)
+                logger.info(
+                    "Saving inference results with score threshold: {:.2f}".format(
+                        self.score_threshold
+                    )
+                )
+                filtered_results = fileter_score_dict(
+                    results_dict, self.score_threshold
+                )
+                total_info = build_total_info(filtered_results)
+                frame_num = count_frame_num(total_info)
+                video_num = count_video_num(total_info)
+                logger.info(f"Frame number: {frame_num}")
+                logger.info(f"Video number: {video_num}")
+                info_path = f"datasets/ytvis_2019/{self.model_name}.json"
+                with open(info_path, "w") as f:
+                    json.dump(total_info, f)
+                new_loader = self.get_train_loader(cfg, self.model_name)
+                if len(cfg.DATASETS.TRAIN) > 1:
+                    self._trainer.data_loader.loader1 = new_loader
+                else:
+                    self._trainer.data_loader = new_loader
+                self._trainer._data_loader_iter_obj = iter(self._trainer.data_loader)
+
+            elif self.test_mode == "frame_iou_pred_test":
+                val_results = self._last_eval_results[cfg.DATASETS.TEST[1]]
+                ap50 = val_results["segm"]["AP50"]
+                current_iou = ap50
+                logger.info("Current AP50: {:.4f}".format(ap50))
+                if ap50 > self.best_iou:
+                    self.best_iou = ap50
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                inf_results = self._last_eval_results[cfg.DATASETS.TEST[0]]["results"]
+                pearson_score = inf_results["pearson"]
+                spearman_score = inf_results["spearman"]
+                logger.info("Current Pearson score: {:.4f}".format(pearson_score))
+                logger.info("Current Spearman score: {:.4f}".format(spearman_score))
+
+            else:
+                raise NotImplementedError()
+
+            if comm.is_main_process():
+                current_iou = float(current_iou)
+                logger.info("Current mean IoU: {:.4f}".format(current_iou))
+                if current_iou > self.best_iou:
+                    self.best_iou = current_iou
+                    # save the best model
+                    self.checkpointer.save("model_best")
+                    logger.info("Best model saved as model_best.pth")
+                    # print("Best model saved as model_best.pth")
+                return {
+                    "best_iou": self.best_iou,
+                    "current_iou": current_iou,
+                }
+            else:
+                return {}
 
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
@@ -474,7 +2095,7 @@ class DefaultTrainer(TrainerBase):
         if comm.is_main_process():
             # Here the default print/log frequency of each writer is used.
             # run writers in the end, so that evaluation metrics are written
-            ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
+            ret.append(hooks.PeriodicWriter(self.build_writers(), period=10))
         return ret
 
     def build_writers(self):
@@ -528,6 +2149,9 @@ class DefaultTrainer(TrainerBase):
         model = build_model(cfg)
         logger = logging.getLogger(__name__)
         logger.info("Model:\n{}".format(model))
+        if hasattr(cfg, "OUTPUT_RAW_MASKS") and cfg.OUTPUT_RAW_MASKS:
+            logger.info("Output raw masks")
+            model.output_raw_masks = True
         return model
 
     @classmethod
@@ -636,7 +2260,9 @@ Alternatively, you can call evaluation functions yourself (see Colab balloon tut
                 ), "Evaluator must return a dict on the main process. Got {} instead.".format(
                     results_i
                 )
-                logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+                logger.info(
+                    "Evaluation results for {} in csv format:".format(dataset_name)
+                )
                 print_csv_format(results_i)
 
         if len(results) == 1:
@@ -699,7 +2325,9 @@ Alternatively, you can call evaluation functions yourself (see Colab balloon tut
         bs = cfg.SOLVER.IMS_PER_BATCH = int(round(cfg.SOLVER.IMS_PER_BATCH * scale))
         lr = cfg.SOLVER.BASE_LR = cfg.SOLVER.BASE_LR * scale
         max_iter = cfg.SOLVER.MAX_ITER = int(round(cfg.SOLVER.MAX_ITER / scale))
-        warmup_iter = cfg.SOLVER.WARMUP_ITERS = int(round(cfg.SOLVER.WARMUP_ITERS / scale))
+        warmup_iter = cfg.SOLVER.WARMUP_ITERS = int(
+            round(cfg.SOLVER.WARMUP_ITERS / scale)
+        )
         cfg.SOLVER.STEPS = tuple(int(round(s / scale)) for s in cfg.SOLVER.STEPS)
         cfg.TEST.EVAL_PERIOD = int(round(cfg.TEST.EVAL_PERIOD / scale))
         cfg.SOLVER.CHECKPOINT_PERIOD = int(round(cfg.SOLVER.CHECKPOINT_PERIOD / scale))

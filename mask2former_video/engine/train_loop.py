@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Modified by XuDong Wang from https://github.com/facebookresearch/detectron2/blob/main/detectron2/engine/train_loop.py
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 import torch
 from torch.nn.parallel import DataParallel, DistributedDataParallel
@@ -156,7 +158,15 @@ class CustomSimpleTrainer(SimpleTrainer):
                     # Use DEEPCOPY, otherwise, the objects will be in-place edited
                     target_instances = copy.deepcopy(target_instances_list[f])
                     target_image = copy.deepcopy(target_image_list[f])
+
                     copied_masks = copy.deepcopy(copied_instances.gt_masks)
+                    if isinstance(copied_masks, torch.Tensor):
+                        if 0 in copied_masks.shape:
+                            continue
+                    else:
+                        if 0 in copied_masks.tensor.shape:
+                            continue
+
                     copied_boxes = copy.deepcopy(copied_instances.gt_boxes)
                     _, labeled_h, labeled_w = source_image_list[frame_id].shape
                     _, unlabeled_h, unlabeled_w = target_image.shape
@@ -363,7 +373,9 @@ class CustomAMPTrainer(CustomSimpleTrainer):
 
         start = time.perf_counter()
         data = next(self._data_loader_iter)
-        if self.use_copy_paste:
+        file_name = data[0]['file_names'][0]
+        if self.use_copy_paste and "imagenet" in file_name:
+            # print("copy and paste for imagenet dataset.")
             data = self.copy_and_paste(copy.deepcopy(data[::-1]), data)
         data_time = time.perf_counter() - start
 

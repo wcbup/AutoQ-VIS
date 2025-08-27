@@ -1,5 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from https://github.com/sukjunhwang/IFC
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 import copy
 import logging
@@ -237,13 +239,20 @@ class YTVISDatasetMapper:
         video_annos = dataset_dict.pop("annotations", None)
         file_names = dataset_dict.pop("file_names", None)
 
-        if self.is_train:
-            _ids = set()
-            for frame_idx in selected_idx:
-                _ids.update([anno["id"] for anno in video_annos[frame_idx]])
-            ids = dict()
-            for i, _id in enumerate(_ids):
-                ids[_id] = i
+        # if self.is_train:
+        #     _ids = set()
+        #     for frame_idx in selected_idx:
+        #         _ids.update([anno["id"] for anno in video_annos[frame_idx]])
+        #     ids = dict()
+        #     for i, _id in enumerate(_ids):
+        #         ids[_id] = i
+        
+        _ids = set()
+        for frame_idx in selected_idx:
+            _ids.update([anno["id"] for anno in video_annos[frame_idx]])
+        ids = dict()
+        for i, _id in enumerate(_ids):
+            ids[_id] = i
 
         dataset_dict["image"] = []
         dataset_dict["instances"] = []
@@ -265,7 +274,8 @@ class YTVISDatasetMapper:
             # Therefore it's important to use torch.Tensor.
             dataset_dict["image"].append(torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))))
 
-            if (video_annos is None) or (not self.is_train):
+            # if (video_annos is None) or (not self.is_train):
+            if video_annos is None:
                 continue
 
             # NOTE copy() is to prevent annotations getting changed from applying augmentations
@@ -289,6 +299,8 @@ class YTVISDatasetMapper:
                 sorted_annos[idx] = _anno
             _gt_ids = [_anno["id"] for _anno in sorted_annos]
 
+            sorted_annos = copy.deepcopy(sorted_annos)
+            # image_shape = copy.deepcopy(image_shape)
             instances = utils.annotations_to_instances(sorted_annos, image_shape, mask_format="bitmask")
             instances.gt_ids = torch.tensor(_gt_ids)
             if instances.has("gt_masks"):

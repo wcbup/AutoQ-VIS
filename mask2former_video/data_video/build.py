@@ -1,5 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from https://github.com/sukjunhwang/IFC
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 import itertools
 import logging
@@ -206,7 +208,7 @@ def _test_loader_from_config(cfg, dataset_name, mapper=None):
 
 
 @configurable(from_config=_test_loader_from_config)
-def build_detection_test_loader(dataset, *, mapper, num_workers=0):
+def build_detection_test_loader(dataset, *, mapper, num_workers=0,shuffle=False):
     """
     Similar to `build_detection_train_loader`, but uses a batch size of 1.
     This interface is experimental.
@@ -241,10 +243,18 @@ def build_detection_test_loader(dataset, *, mapper, num_workers=0):
     # Always use 1 image per worker during inference since this is the
     # standard when reporting inference time in papers.
     batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, 1, drop_last=False)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=num_workers,
-        batch_sampler=batch_sampler,
-        collate_fn=trivial_batch_collator,
-    )
+    if shuffle:
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            collate_fn=trivial_batch_collator,
+            shuffle=True,
+        )
+    else:
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_sampler=batch_sampler,
+            collate_fn=trivial_batch_collator,
+        )
     return data_loader

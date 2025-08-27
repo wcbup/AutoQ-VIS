@@ -1,0 +1,33 @@
+_BASE_: video_mask2former_R50_cls_agnostic.yaml
+SOLVER:
+  IMS_PER_BATCH: 2
+  BASE_LR: 0.00002
+  STEPS: (7999,)
+  MAX_ITER: 8000
+# DATALOADER:
+#   COPY_PASTE: False
+
+DATASETS:
+  # TRAIN: ("davis_train", "imagenet_video_train_cls_agnostic")
+  # TRAIN: ("davis_train", )
+  # TRAIN: ("davis_val_inference", )
+  # TRAIN: ("davis_inf_test", )
+  # TRAIN: ("ytvis_2019_train_new", )
+  # TRAIN: ("ytvis_test",)
+  # TRAIN: ("ytvis_test", "ytvis_2019_train_new")
+  # TRAIN: ("ytvis_2019_small", "ytvis_2019_val_30")
+  # TRAIN: ("ytvis_2019_small", )
+  TRAIN: ("imagenet_video_train_cls_agnostic",)
+  # TEST: ("davis_val_half", "davis_train_half")
+  # TEST: ("ytvis_2019_val_new", "ytvis_2019_small")
+  # TEST: ("ytvis_2019_val_30", "ytvis_2019_small" )
+  TEST: ("ytvis_2019_val_new", "ytvis_2019_val_new_" )
+TEST:
+  EVAL_PERIOD: 800
+MODEL_NAME: "imgnet_iou_pred_all"
+OUTPUT_RAW_MASKS: True
+OUTPUT_IOUS: True
+OUTPUT_MASKIOUS: True
+# FREEZE_ALL: True
+# TRAIN_MASKIOU: True
+LOSS_MASKIOU_ALL: True

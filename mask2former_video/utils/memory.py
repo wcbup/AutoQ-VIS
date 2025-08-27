@@ -1,9 +1,12 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 import logging
 from contextlib import contextmanager
 from functools import wraps
 import torch
+import gc
 from torch.cuda.amp import autocast
 
 __all__ = ["retry_if_cuda_oom"]
@@ -65,6 +68,7 @@ def retry_if_cuda_oom(func):
             return func(*args, **kwargs)
 
         # Clear cache and retry
+        gc.collect()
         torch.cuda.empty_cache()
         with _ignore_torch_cuda_oom():
             return func(*args, **kwargs)

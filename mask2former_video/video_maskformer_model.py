@@ -1,4 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
+
 import logging
 import math
 from typing import Tuple
@@ -18,7 +21,53 @@ from .modeling.criterion import VideoSetCriterion
 from .modeling.matcher import VideoHungarianMatcher
 from .utils.memory import retry_if_cuda_oom
 
+from einops import rearrange
+
 logger = logging.getLogger(__name__)
+
+# class MaskIoUFeatureExtractor(nn.Module):
+#     """
+#     MaskIou head feature extractor.
+#     """
+
+#     def __init__(self):
+#         super(MaskIoUFeatureExtractor, self).__init__()
+        
+#         input_channels = 257 
+
+#         self.maskiou_fcn1 = nn.Conv2d(input_channels, 256, 3, 1, 1) 
+#         self.maskiou_fcn2 = nn.Conv2d(256, 256, 3, 1, 1) 
+#         self.maskiou_fcn3 = nn.Conv2d(256, 256, 3, 1, 1) 
+#         self.maskiou_fcn4 = nn.Conv2d(256, 256, 3, 2, 1) 
+#         self.maskiou_fc1 = nn.Linear(256*7*7, 1024)
+#         self.maskiou_fc2 = nn.Linear(1024, 1024)
+#         self.maskiou_fc3 = nn.Linear(1024, 1)
+
+#         for l in [self.maskiou_fcn1, self.maskiou_fcn2, self.maskiou_fcn3, self.maskiou_fcn4]:
+#             nn.init.kaiming_normal_(l.weight, mode="fan_out", nonlinearity="relu")
+#             nn.init.constant_(l.bias, 0)
+
+#         for l in [self.maskiou_fc1, self.maskiou_fc2]:
+#             nn.init.kaiming_uniform_(l.weight, a=1)
+#             nn.init.constant_(l.bias, 0)
+        
+#         nn.init.normal_(self.maskiou_fc3.weight, mean=0, std=0.01)
+#         nn.init.constant_(self.maskiou_fc3.bias, 0)
+
+
+#     def forward(self, x, mask):
+#         mask_pool = F.max_pool2d(mask, kernel_size=2, stride=2)
+#         x = torch.cat((x, mask_pool), 1)
+#         x = F.relu(self.maskiou_fcn1(x))
+#         x = F.relu(self.maskiou_fcn2(x))
+#         x = F.relu(self.maskiou_fcn3(x))
+#         x = F.relu(self.maskiou_fcn4(x))
+#         x = x.view(x.size(0), -1)
+#         x = F.relu(self.maskiou_fc1(x))
+#         x = F.relu(self.maskiou_fc2(x))
+#         x = self.maskiou_fc3(x)
+ 
+#         return x
 
 
 @META_ARCH_REGISTRY.register()
@@ -44,6 +93,14 @@ class VideoMaskFormer(nn.Module):
         pixel_std: Tuple[float],
         # video
         num_frames,
+        output_raw_masks: bool = False,
+        output_maskiou: bool = False,
+        output_maskiou_v2: bool = False,
+        vit_maskious: bool = False,
+        freeze_all: bool = False,
+        train_maskiou: bool = False,
+        freeze_maskiou: bool = False,
+        maskiou_only_imagenet: bool = False,
     ):
         """
         Args:
@@ -86,6 +143,24 @@ class VideoMaskFormer(nn.Module):
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
 
         self.num_frames = num_frames
+        self.output_raw_masks = output_raw_masks
+        # self.maskiou_feature_extractor = MaskIoUFeatureExtractor()
+        self.output_maskiou = output_maskiou
+        self.output_maskiou_v2 = output_maskiou_v2
+        self.vit_maskious = vit_maskious
+
+        if freeze_all:
+            for param in self.parameters():
+                param.requires_grad = False
+        if train_maskiou:
+            for param in self.sem_seg_head.predictor.maskiou_feature_extractor.parameters():
+                param.requires_grad = True
+        if freeze_maskiou:
+            for param in self.sem_seg_head.predictor.maskiou_feature_extractor.parameters():
+                param.requires_grad = False
+        
+        self.maskiou_only_imagenet = maskiou_only_imagenet
+
 
     @classmethod
     def from_config(cls, cfg):
@@ -109,7 +184,51 @@ class VideoMaskFormer(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        if hasattr(cfg, "OUTPUT_MASKIOUS") and cfg.OUTPUT_MASKIOUS:
+            output_maskiou = True
+        else:
+            output_maskiou = False
+        if hasattr(cfg, "OUTPUT_MASKIOUS_V2") and cfg.OUTPUT_MASKIOUS_V2:
+            output_maskiou_v2 = True
+        else:
+            output_maskiou_v2 = False
+        if hasattr(cfg, "VIT_MASKIOUS") and cfg.VIT_MASKIOUS:
+            vit_maskious = True
+        else:
+            vit_maskious = False
+
+        if output_maskiou or output_maskiou_v2:
+            weight_dict = {
+                "loss_ce": class_weight,
+                "loss_mask": mask_weight,
+                "loss_dice": dice_weight,
+                "loss_maskiou": 20.0,
+            }
+        elif vit_maskious:
+            weight_dict = {
+                "loss_ce": class_weight,
+                "loss_mask": mask_weight,
+                "loss_dice": dice_weight,
+                "loss_vit_maskiou": 10.0,
+            }
+        else:
+            weight_dict = {
+                "loss_ce": class_weight,
+                "loss_mask": mask_weight,
+                "loss_dice": dice_weight,
+            }
+
+        if hasattr(cfg, "USE_DROPLOSS") and cfg.USE_DROPLOSS:
+            use_drop_loss = cfg.USE_DROPLOSS
+        else:
+            use_drop_loss = False
+
+        if hasattr(cfg, "LABEL_DROPLOSS") and cfg.LABEL_DROPLOSS:
+            label_drop_loss = cfg.LABEL_DROPLOSS
+            # weight_dict["loss_ce"] = class_weight * 10
+        else:
+            label_drop_loss = False
+        
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -118,8 +237,86 @@ class VideoMaskFormer(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        if output_maskiou or output_maskiou_v2:
+            losses = ["labels", "masks", "maskiou"]
+        elif vit_maskious:
+            losses = ["labels", "masks", "vit_maskiou"]
+        else:
+            losses = ["labels", "masks"]
 
+        if hasattr(cfg, "FREEZE_ALL") and cfg.FREEZE_ALL:
+            freeze_all = cfg.FREEZE_ALL
+        else:
+            freeze_all = False
+
+        if hasattr(cfg, "TRAIN_MASKIOU") and cfg.TRAIN_MASKIOU:
+            train_maskiou = cfg.TRAIN_MASKIOU
+        else:
+            train_maskiou = False
+        
+        if hasattr(cfg, "FREEZE_MASKIOU") and cfg.FREEZE_MASKIOU:
+            freeze_maskiou = cfg.FREEZE_MASKIOU
+        else:
+            freeze_maskiou = False
+        
+        if freeze_all and train_maskiou:
+            losses.remove("labels")
+            losses.remove("masks")
+        
+        if freeze_maskiou:
+            losses.remove("maskiou")
+        
+        
+        
+        if hasattr(cfg, "LOSS_MASKIOU_ALL") and cfg.LOSS_MASKIOU_ALL:
+            loss_maskiou_all = cfg.LOSS_MASKIOU_ALL
+        else:
+            loss_maskiou_all = False
+        
+        if hasattr(cfg, "LOSS_MASKIOU_BAL") and cfg.LOSS_MASKIOU_BAL:
+            loss_maskiou_bal = cfg.LOSS_MASKIOU_BAL
+        else:
+            loss_maskiou_bal = False
+        
+        if label_drop_loss:
+            # replace "labels" with "labels_drop"
+            for i in range(len(losses)):
+                if losses[i] == "labels":
+                    losses[i] = "labels_drop"
+        
+        if use_drop_loss:
+            # replace "masks" with "masks_drop"
+            for i in range(len(losses)):
+                if losses[i] == "masks":
+                    losses[i] = "masks_drop"
+                if losses[i] == "maskiou":
+                    losses[i] = "maskiou_drop"
+        
+        if loss_maskiou_all:
+            # replace "maskiou" with "maskiou_all"
+            for i in range(len(losses)):
+                if losses[i] == "maskiou":
+                    losses[i] = "maskiou_all"
+                if losses[i] == "maskiou_drop":
+                    losses[i] = "maskiou_all_drop"
+
+        if loss_maskiou_bal and loss_maskiou_all:
+            raise ValueError("maskiou_all and maskiou_bal cannot be used at the same time")
+        
+        if loss_maskiou_bal:
+            # replace "maskiou" with "maskiou_bal"
+            for i in range(len(losses)):
+                if losses[i] == "maskiou":
+                    losses[i] = "maskiou_bal"
+                if losses[i] == "maskiou_drop":
+                    losses[i] = "maskiou_bal"
+
+        if hasattr(cfg, "MASK_THE_FEATURE") and cfg.MASK_THE_FEATURE:
+            mask_the_feature = True
+        else:
+            mask_the_feature = False
+        
+            
         criterion = VideoSetCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
@@ -129,7 +326,13 @@ class VideoMaskFormer(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            mask_the_feature=mask_the_feature,
         )
+
+        if hasattr(cfg, "MASKIOU_ONLY_IMAGENET") and cfg.MASKIOU_ONLY_IMAGENET:
+            maskiou_only_imagenet = cfg.MASKIOU_ONLY_IMAGENET
+        else:
+            maskiou_only_imagenet = False
 
         return {
             "backbone": backbone,
@@ -145,6 +348,13 @@ class VideoMaskFormer(nn.Module):
             "pixel_std": cfg.MODEL.PIXEL_STD,
             # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
+            "output_maskiou": output_maskiou,
+            "output_maskiou_v2": output_maskiou_v2,
+            "vit_maskious": vit_maskious,
+            "freeze_all": freeze_all,
+            "train_maskiou": train_maskiou,
+            "freeze_maskiou": freeze_maskiou,
+            "maskiou_only_imagenet": maskiou_only_imagenet,
         }
 
     @property
@@ -200,10 +410,32 @@ class VideoMaskFormer(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+
+            if self.maskiou_only_imagenet:
+                # only train maskiou on imagenet
+                filename = batched_inputs[0]["file_names"][0]
+                if "imagenet" not in filename:
+                    loss_keys = list(losses.keys())
+                    for key in loss_keys:
+                        if "maskiou" in key:
+                            losses.pop(key)
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
+            
+            if self.output_maskiou or self.output_maskiou_v2:
+                mask_iou_results = outputs["pred_maskiou"]
+                mask_iou_result = mask_iou_results[0]
+            else:
+                mask_iou_result = None
+            
+            if self.vit_maskious:
+                frame_maskious = outputs["pred_frame_ious"]
+                if frame_maskious is not None:
+                    frame_maskious = frame_maskious[0]
+            else:
+                frame_maskious = None
 
             mask_cls_result = mask_cls_results[0]
             # upsample masks
@@ -222,7 +454,7 @@ class VideoMaskFormer(nn.Module):
             height = input_per_image.get("height", image_size[0])  # raw image size before data augmentation
             width = input_per_image.get("width", image_size[1])
 
-            return retry_if_cuda_oom(self.inference_video)(mask_cls_result, mask_pred_result, image_size, height, width)
+            return retry_if_cuda_oom(self.inference_video)(mask_cls_result, mask_pred_result, image_size, height, width, mask_iou_result, frame_maskious)
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -252,13 +484,26 @@ class VideoMaskFormer(nn.Module):
 
         return gt_instances
 
-    def inference_video(self, pred_cls, pred_masks, img_size, output_height, output_width):
+    def inference_video(
+        self,
+        pred_cls,
+        pred_masks,
+        img_size,
+        output_height,
+        output_width,
+        mask_ious,
+        frame_maskious,
+    ):
+        if frame_maskious is None:
+            t = pred_masks.shape[1]
+            frame_maskious = torch.Tensor([0.0] * t)
+
         if len(pred_cls) > 0:
             scores = F.softmax(pred_cls, dim=-1)[:, :-1]
             labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
             # keep top-10 predictions
             # TODO: make it configurable
-            scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=False)
+            scores_per_image, topk_indices = scores.flatten(0, 1).topk(10, sorted=True)
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
             pred_masks = pred_masks[topk_indices]
@@ -273,16 +518,33 @@ class VideoMaskFormer(nn.Module):
             out_scores = scores_per_image.tolist()
             out_labels = labels_per_image.tolist()
             out_masks = [m for m in masks.cpu()]
+
+            if self.output_maskiou or self.output_maskiou_v2:
+                mask_ious = mask_ious[topk_indices]
+                mask_ious = mask_ious.clamp(0, 1)
+                out_ious = mask_ious.tolist()
+            else:
+                out_ious = []
+
+
         else:
             out_scores = []
             out_labels = []
             out_masks = []
+            out_ious = []
+
+        raw_masks = pred_masks if self.output_raw_masks else None
+
+        
 
         video_output = {
             "image_size": (output_height, output_width),
             "pred_scores": out_scores,
             "pred_labels": out_labels,
             "pred_masks": out_masks,
+            "raw_masks": raw_masks,
+            "pred_ious": out_ious,
+            "pred_frame_ious": frame_maskious.tolist(),
         }
 
         return video_output

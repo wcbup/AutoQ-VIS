@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Modified by XuDong Wang from https://github.com/facebookresearch/Mask2Former/tree/main/mask2former_video
 
+# ------------------------------------------------------------------------------------------------
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
 
 import contextlib
 import io
@@ -135,6 +137,17 @@ def _get_ytvis_2019_instances_meta():
     }
     return ret
 
+def _get_ytvis_2019_small_instances_meta():
+    thing_dataset_id_to_contiguous_id = {1:0}
+    thing_classes = ["object"]
+    thing_colors = [[220, 20, 60]]
+    ret = {
+        "thing_dataset_id_to_contiguous_id": thing_dataset_id_to_contiguous_id,
+        "thing_classes": thing_classes,
+        "thing_colors": thing_colors,
+    }
+    return ret
+
 def _get_ytvis_2021_instances_meta():
     thing_ids = [k["id"] for k in YTVIS_CATEGORIES_2021 if k["isthing"] == 1]
     thing_colors = [k["color"] for k in YTVIS_CATEGORIES_2021 if k["isthing"] == 1]
@@ -250,6 +263,12 @@ Category ids in annotations are not in [1, #categories]! We'll apply a mapping f
                 _bboxes = anno.get("bboxes", None)
                 _segm = anno.get("segmentations", None)
 
+                if _bboxes is not None and _segm is not None:
+                    if frame_idx >= len(_bboxes) or frame_idx >= len(_segm):
+                        print(
+                            f"Warning: frame_idx {frame_idx} is out of range for bboxes or segmentations in video {video_id}"
+                        )
+                        print(_bboxes, _segm)
                 if not (_bboxes and _segm and _bboxes[frame_idx] and _segm[frame_idx]):
                     continue
 
