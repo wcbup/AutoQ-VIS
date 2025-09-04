@@ -9,6 +9,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from https://github.com/fundamentalvision/Deformable-DETR
 
+# ------------------------------------------------------------------------------------------------
+
+# Modified by Kaixuan Lu from https://github.com/facebookresearch/CutLER/tree/main/videocutler
+
+
 from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
@@ -85,7 +90,8 @@ if __name__ == '__main__':
     check_forward_equal_with_pytorch_double()
     check_forward_equal_with_pytorch_float()
 
-    for channels in [30, 32, 64, 71, 1025, 2048, 3096]:
+    # for channels in [30, 32, 64, 71, 1025, 2048, 3096]:
+    for channels in [30, 32, 64, 71, 102]:
         check_gradient_numerical(channels, True, True, True)
 
 

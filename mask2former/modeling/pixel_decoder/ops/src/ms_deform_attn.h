@@ -6,11 +6,9 @@
 **************************************************************************************************
 * Modified from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/tree/pytorch_1.0.0
 **************************************************************************************************
-*/
-
-/*!
-* Copyright (c) Facebook, Inc. and its affiliates.
-* Modified by Bowen Cheng from https://github.com/fundamentalvision/Deformable-DETR
+Modified from https://github.com/facebookresearch/CutLER/tree/main/videocutler
+Modified by Kaixuan Lu
+**************************************************************************************************
 */
 
 #pragma once
@@ -31,7 +29,7 @@ ms_deform_attn_forward(
     const at::Tensor &attn_weight,
     const int im2col_step)
 {
-    if (value.type().is_cuda())
+    if (value.is_cuda())
     {
 #ifdef WITH_CUDA
         return ms_deform_attn_cuda_forward(
@@ -53,7 +51,7 @@ ms_deform_attn_backward(
     const at::Tensor &grad_output,
     const int im2col_step)
 {
-    if (value.type().is_cuda())
+    if (value.is_cuda())
     {
 #ifdef WITH_CUDA
         return ms_deform_attn_cuda_backward(
@@ -64,4 +62,3 @@ ms_deform_attn_backward(
     }
     AT_ERROR("Not implemented on the CPU");
 }
-
