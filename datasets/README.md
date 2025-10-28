@@ -7,6 +7,7 @@ Under this directory, detectron2 will look for datasets in the structure describ
 $DETECTRON2_DATASETS/
   imagenet/
   ytvis_2019/
+  UVO-Dense/
 ```
 
 Expected dataset structure for [YouTubeVIS 2019](https://competitions.codalab.org/competitions/20128):

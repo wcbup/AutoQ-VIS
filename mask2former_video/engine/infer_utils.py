@@ -912,7 +912,7 @@ class MyYTVIS:
         data = copy.deepcopy(data)
         self.base_path = base_path
         self.videos = data["videos"]
-        if "JPEGImages" in self.videos[0]["file_names"][0]:
+        if "JPEGImages" in self.videos[0]["file_names"][0] or "uvo_videos_dense_frames" in self.videos[0]["file_names"][0]:
 
             def get_relative_path(file_name):
                 file_name = file_name.split("/")[-2:]

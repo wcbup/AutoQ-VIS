@@ -50,7 +50,7 @@ class CustomSimpleTrainer(SimpleTrainer):
             data_loader: an iterable. Contains data to be used to call model.
             optimizer: a torch optimizer.
         """
-        super().__init__(model, data_loader, optimizer)
+        super().__init__(model, data_loader, optimizer, async_write_metrics=True)
 
         """
         We set the model to training mode in the trainer.
