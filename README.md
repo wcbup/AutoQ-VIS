@@ -2,7 +2,7 @@
 
 By [Kaixaun Lu](https://github.com/wcbup), [Mehmet Onurcan Kaya](https://github.com/monurcan), [Dim P. Papadopoulos](https://dimipapa.github.io/).
 
-This repository is an official implementation of the paper [AutoQ-VIS: Improving Unsupervised Video Instance Segmentation via Automatic Quality Assessment](https://arxiv.org/abs/2508.19808).
+This repository is an official implementation of the paper [AutoQ-VIS: Improving Unsupervised Video Instance Segmentation via Automatic Quality Assessment](https://arxiv.org/abs/2508.19808) and [Boosting Unsupervised Video Instance Segmentation with Automatic Quality-Guided Self-Training](https://arxiv.org/abs/2512.06864).
 
 ## Introduction
 
